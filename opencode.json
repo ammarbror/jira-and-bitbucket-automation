@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "command": {
+    "review-pr": {
+      "description": "Reviews a Bitbucket pull request and posts findings + Jira cross-references. Usage: /review-pr <bitbucket-pr-url>",
+      "template": "You are a PR review automation agent for Bitbucket + Jira. The user wants you to review this Bitbucket pull request.\n\nExtract the PR URL from: $ARGUMENTS\n\n1. Call `fetchReviewData(url)` to get PR metadata, diff, and Jira keys\n2. Use `buildReviewPrompt(diff, title, description)` from prompts.ts to construct the review prompt\n3. Review the diff yourself using the severity rules (CRITICAL/HIGH/BUG only — no style issues)\n4. Parse your findings into `ReviewFinding[]` format\n5. Call `postBitbucketComments(prInfo, bbConfig, findings)` to post the general + inline comments\n6. If jiraKeys are found, call `postJiraComments(prUrl, title, jiraKeys, jiraConfig, findings)`\n7. Return a summary to the user with the findings count"
+    },
+    "create-ticket": {
+      "description": "Creates a Jira ticket in the KAIRA project from a natural language description and assigns it to the current/open sprint. Supports work types: task, bug, story. Usage: /create-ticket <work-type>: <description>",
+      "template": "You are a Jira ticket creation agent for project KAIRA. The user provides a description and you generate a summary + work type + description and create the ticket.\n\n**Work Type Detection** (in order of priority):\n1. If the user starts with a prefix like `task:`, `bug:`, or `story:` (or `feature:`) — use that as the work type\n2. Otherwise, infer from the description: bug/error/crash/issue → `Bug`; feature/enhancement/request/wish → `Story`; everything else → `Task`\n3. Strip the prefix from the summary and description\n\nInstructions:\n1. From $ARGUMENTS, detect the work type (Task/Bug/Story) and generate:\n   - A concise **summary** (Jira issue title, max ~80 chars, in English)\n   - A **description** that preserves the original context, user request, and any specifics mentioned\n2. Call the workflow:\n   - `import { loadJiraConfig } from './src/review-pr/index.ts'`\n   - `import { createTicketWorkflow } from './src/create-ticket/index.ts'`\n   - `const config = loadJiraConfig()`\n   - `const result = await createTicketWorkflow(config, { summary, description, issueType: '<detected-type>' })`\n3. Send the result back to the user with the issue key, sprint name, work type, and summary.\n\nAlways use the configured Jira project (from JIRA_PROJECT_KEY env, which is KAIRA). Always try to assign to current sprint first; if no active sprint, assign to the next open sprint. If the user doesn't specify a work type, use Task as the default."
+    }
+  }
+}
