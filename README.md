@@ -5,7 +5,8 @@ OpenCode slash commands that bridge Jira and Bitbucket: create Jira tickets and 
 ## Features
 
 - **`/review-pr <bitbucket-pr-url>`** — Fetches the PR diff, runs an LLM-based review (CRITICAL/HIGH/BUG only), posts findings as Bitbucket comments + inline annotations, and cross-references linked Jira issues with a review summary.
-- **`/create-ticket <work-type>: <description>`** — Creates a Jira ticket and assigns it to the current active sprint. Supports `task:`, `bug:`, `story:` (or `feature:`) prefixes; auto-detects work type from description when no prefix is given.
+- **`/create-ticket <work-type>: <description>`** — Creates a Jira ticket and assigns it to the current active sprint. Supports `task:`, `bug:`, `story:` (or `feature:`) prefixes; auto-detects work type from description when no prefix is given. Descriptions are automatically wrapped in structured templates with headings, acceptance criteria, and definition of done.
+- **`/edit-ticket <issue-key> [summary: ...] [description: ...] [assign: ...]`** — Updates an existing Jira ticket's summary, description, or assignee without leaving your chat session.
 
 ## Getting Started
 
@@ -39,7 +40,7 @@ cp .env.example .env
 
 ### OpenCode Integration
 
-The project is already configured for OpenCode via `opencode.json`. Once cloned into a workspace OpenCode has access to, the `/review-pr` and `/create-ticket` commands are automatically available.
+The project is already configured for OpenCode via `opencode.json`. Once cloned into a workspace OpenCode has access to, the `/review-pr`, `/create-ticket`, and `/edit-ticket` commands are automatically available.
 
 The `opencode.json` config registers each command with:
 - A **description** shown in OpenCode's command list.
@@ -77,20 +78,40 @@ What happens:
 2. Strips the prefix and generates a concise summary (max ~80 chars).
 3. Creates the issue in the configured Jira project.
 4. Finds the current active sprint (or next open sprint) and assigns the ticket to it.
-5. Returns the issue key, sprint name, board name, and summary.
+5. The description is automatically wrapped in a structured template based on work type:
+   - **Task** — Description → Technical Details → Definition of Done → Notes
+   - **Story** — User Story → Acceptance Criteria → Additional Context
+   - **Bug** — Description → Steps to Reproduce → Expected/Actual → Environment → Screenshots
+6. Returns the issue key, sprint name, board name, work type, and summary.
+
+### `/edit-ticket`
+
+```
+/edit-ticket KAIRA-363 description: Add better acceptance criteria
+/edit-ticket KAIRA-363 assign: aulia rafi
+/edit-ticket KAIRA-363 summary: New title for the ticket
+```
+
+What happens:
+1. Parses the issue key and optional fields (summary, description, assignee).
+2. If assignee is provided as a name, resolves it to a Jira account ID via `searchUsers()`.
+3. Calls the Jira API to update only the provided fields (partial update).
+4. Returns what was updated and the current issue status.
 
 ## Architecture
 
 ```
 src/
 ├── create-ticket/
-│   └── index.ts           # createTicketWorkflow() — issue creation + sprint assignment
+│   └── index.ts           # createTicketWorkflow() — issue creation + sprint assignment + description templates
+├── edit-ticket/
+│   └── index.ts           # editTicketWorkflow() — update summary, description, assignee on existing tickets
 └── review-pr/
     ├── index.ts            # fetchReviewData(), postBitbucketComments(), postJiraComments()
     ├── types.ts            # TypeScript interfaces (PRInfo, ReviewFinding, configs...)
     ├── url-parser.ts       # parsePRURL() — Bitbucket PR URL → PRInfo
     ├── bitbucket-client.ts # Bitbucket API: fetch PR info, diff, commits, post comments
-    ├── jira-client.ts      # Jira API: create issue, find boards/sprints, post comments, transitions
+    ├── jira-client.ts      # Jira API: create/update issues, find boards/sprints, post comments, transitions, ADF formatting
     ├── jira-detector.ts    # extractJiraKeys() — regex scan for Jira issue keys in text
     ├── prompts.ts          # Review system prompt + buildReviewPrompt() with diff injection
     └── e2e-test.ts         # End-to-end test exercising the full workflow
