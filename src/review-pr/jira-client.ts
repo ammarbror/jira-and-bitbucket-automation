@@ -16,7 +16,7 @@ async function jiraFetch<T>(
     ...(options.headers as Record<string, string> | undefined),
   };
 
-  if (options.method === 'POST' && options.body) {
+  if (options.body) {
     headers['Content-Type'] = 'application/json';
   }
 
@@ -31,7 +31,9 @@ async function jiraFetch<T>(
 
   const contentType = response.headers.get('content-type') ?? '';
   if (contentType.includes('application/json')) {
-    return (await response.json()) as T;
+    const text = await response.text();
+    if (!text) return undefined as T;
+    return JSON.parse(text) as T;
   }
 
   return undefined as T;
@@ -130,23 +132,132 @@ export async function addIssueCommentADF(
 // ---------------------------------------------------------------------------
 
 /**
- * Convert a plain text string into Atlassian Document Format (ADF).
- * Handles newlines as paragraph breaks.
+ * Parse a template-formatted description into Atlassian Document Format (ADF).
+ *
+ * Supports:
+ *   `h3. Title`         → heading level 3
+ *   `h4. Title`         → heading level 4
+ *   `- [ ] task`        → bulletList with [ ] prefix (Jira Cloud doesn't support ADF taskList)
+ *   `- [x] task`        → bulletList with [x] prefix
+ *   `- item`            → bulletList item
+ *   `1. item`           → orderedList item
+ *   plain text          → paragraph
+ *   blank lines         → skipped (separators only, no empty paragraphs)
  */
-export function textToADF(text: string): {
-  type: 'doc';
-  version: 1;
-  content: { type: 'paragraph'; content: { type: 'text'; text: string }[] }[];
-} {
-  const paragraphs = text.split('\n').filter((p) => p.trim().length > 0);
-  const content = paragraphs.map((p) => ({
-    type: 'paragraph' as const,
-    content: [{ type: 'text' as const, text: p }],
-  }));
-  // If no non-empty lines, at least render an empty paragraph
-  if (content.length === 0) {
-    content.push({ type: 'paragraph', content: [{ type: 'text', text: '' }] });
+export function textToADF(text: string): Record<string, unknown> {
+  const lines = text.split('\n');
+  function textNode(t: string) {
+    return { type: 'text' as const, text: t };
   }
+  function paragraph(text: string) {
+    return { type: 'paragraph' as const, content: [textNode(text)] };
+  }
+
+  const content: Record<string, unknown>[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const raw = lines[i];
+    const trimmed = raw.trim();
+
+    // blank line → skip
+    if (!trimmed) {
+      i++;
+      continue;
+    }
+
+    // heading
+    const h3 = trimmed.match(/^h3\.\s+(.+)/);
+    if (h3) {
+      content.push({
+        type: 'heading',
+        attrs: { level: 3 },
+        content: [textNode(h3[1])],
+      });
+      i++;
+      continue;
+    }
+    const h4 = trimmed.match(/^h4\.\s+(.+)/);
+    if (h4) {
+      content.push({
+        type: 'heading',
+        attrs: { level: 4 },
+        content: [textNode(h4[1])],
+      });
+      i++;
+      continue;
+    }
+
+    // checkbox items (- [ ] / - [x]) → bulletList with [ ] or [x] prefix
+    // Jira Cloud does NOT support ADF taskList, so we render as bullets
+    if (/^- \[[ x]\]\s/.test(trimmed)) {
+      const items: string[] = [];
+      while (i < lines.length) {
+        const t = lines[i].trim();
+        const m = t.match(/^- \[([ x])\]\s+(.+)/);
+        if (!m) break;
+        items.push(`${m[1] === 'x' ? '[x]' : '[ ]'} ${m[2]}`);
+        i++;
+      }
+      content.push({
+        type: 'bulletList',
+        content: items.map((item) => ({
+          type: 'listItem',
+          content: [paragraph(item)],
+        })),
+      });
+      continue;
+    }
+
+    // bullet list: - item
+    if (/^- \S/.test(trimmed) || /^\*\s/.test(trimmed)) {
+      const items: string[] = [];
+      while (i < lines.length) {
+        const t = lines[i].trim();
+        const m = t.match(/^[-*]\s+(.+)/);
+        if (!m) break;
+        items.push(m[1]);
+        i++;
+      }
+      content.push({
+        type: 'bulletList',
+        content: items.map((item) => ({
+          type: 'listItem',
+          content: [paragraph(item)],
+        })),
+      });
+      continue;
+    }
+
+    // ordered list: 1. item
+    if (/^\d+\.\s/.test(trimmed)) {
+      const items: string[] = [];
+      while (i < lines.length) {
+        const t = lines[i].trim();
+        const m = t.match(/^\d+\.\s+(.+)/);
+        if (!m) break;
+        items.push(m[1]);
+        i++;
+      }
+      content.push({
+        type: 'orderedList',
+        content: items.map((item) => ({
+          type: 'listItem',
+          content: [paragraph(item)],
+        })),
+      });
+      continue;
+    }
+
+    // default → paragraph
+    content.push(paragraph(trimmed));
+    i++;
+  }
+
+  if (content.length === 0) {
+    content.push(paragraph(''));
+  }
+
   return { type: 'doc', version: 1, content };
 }
 
@@ -171,6 +282,52 @@ export interface CreateIssueResult {
  * Uses Jira Cloud REST API v3 – POST /rest/api/3/issue
  * https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-post
  */
+/**
+ * Update fields on an existing Jira issue.
+ *
+ * PUT /rest/api/3/issue/{issueKey}
+ * Only provided fields are updated (partial update).
+ */
+export async function updateIssue(
+  config: JiraConfig,
+  issueKey: string,
+  fields: {
+    summary?: string;
+    description?: string;
+    assigneeAccountId?: string | null;
+    customFields?: Record<string, unknown>;
+  },
+): Promise<void> {
+  const url = `${config.baseUrl}/rest/api/3/issue/${issueKey}`;
+
+  const bodyFields: Record<string, unknown> = {};
+
+  if (fields.summary !== undefined) {
+    bodyFields.summary = fields.summary;
+  }
+
+  if (fields.description !== undefined) {
+    bodyFields.description = textToADF(fields.description);
+  }
+
+  if (fields.assigneeAccountId !== undefined) {
+    if (fields.assigneeAccountId === null) {
+      bodyFields.assignee = null;
+    } else {
+      bodyFields.assignee = { id: fields.assigneeAccountId };
+    }
+  }
+
+  if (fields.customFields) {
+    Object.assign(bodyFields, fields.customFields);
+  }
+
+  await jiraFetch(url, config, {
+    method: 'PUT',
+    body: JSON.stringify({ fields: bodyFields }),
+  });
+}
+
 export async function createIssue(
   config: JiraConfig,
   params: CreateIssueParams,
